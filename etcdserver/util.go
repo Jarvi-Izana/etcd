@@ -21,10 +21,10 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"go.etcd.io/etcd/etcdserver/api/membership"
-	"go.etcd.io/etcd/etcdserver/api/rafthttp"
-	pb "go.etcd.io/etcd/etcdserver/etcdserverpb"
-	"go.etcd.io/etcd/pkg/types"
+	"go.etcd.io/etcd/v3/etcdserver/api/membership"
+	"go.etcd.io/etcd/v3/etcdserver/api/rafthttp"
+	pb "go.etcd.io/etcd/v3/etcdserver/etcdserverpb"
+	"go.etcd.io/etcd/v3/pkg/types"
 
 	"go.uber.org/zap"
 )
@@ -111,6 +111,21 @@ func warnOfExpensiveRequest(lg *zap.Logger, now time.Time, reqStringer fmt.Strin
 	warnOfExpensiveGenericRequest(lg, now, reqStringer, "", resp, err)
 }
 
+func warnOfFailedRequest(lg *zap.Logger, now time.Time, reqStringer fmt.Stringer, respMsg proto.Message, err error) {
+	var resp string
+	if !isNil(respMsg) {
+		resp = fmt.Sprintf("size:%d", proto.Size(respMsg))
+	}
+	d := time.Since(now)
+	lg.Warn(
+		"failed to apply request",
+		zap.Duration("took", d),
+		zap.String("request", reqStringer.String()),
+		zap.String("response", resp),
+		zap.Error(err),
+	)
+}
+
 func warnOfExpensiveReadOnlyTxnRequest(lg *zap.Logger, now time.Time, r *pb.TxnRequest, txnResponse *pb.TxnResponse, err error) {
 	reqStringer := pb.NewLoggableTxnRequest(r)
 	var resp string
@@ -140,29 +155,37 @@ func warnOfExpensiveReadOnlyRangeRequest(lg *zap.Logger, now time.Time, reqStrin
 func warnOfExpensiveGenericRequest(lg *zap.Logger, now time.Time, reqStringer fmt.Stringer, prefix string, resp string, err error) {
 	d := time.Since(now)
 	if d > warnApplyDuration {
-		if lg != nil {
-			lg.Warn(
-				"apply request took too long",
-				zap.Duration("took", d),
-				zap.Duration("expected-duration", warnApplyDuration),
-				zap.String("prefix", prefix),
-				zap.String("request", reqStringer.String()),
-				zap.String("response", resp),
-				zap.Error(err),
-			)
-		} else {
-			var result string
-			if err != nil {
-				result = fmt.Sprintf("error:%v", err)
-			} else {
-				result = resp
-			}
-			plog.Warningf("%srequest %q with result %q took too long (%v) to execute", prefix, reqStringer.String(), result, d)
-		}
+		lg.Warn(
+			"apply request took too long",
+			zap.Duration("took", d),
+			zap.Duration("expected-duration", warnApplyDuration),
+			zap.String("prefix", prefix),
+			zap.String("request", reqStringer.String()),
+			zap.String("response", resp),
+			zap.Error(err),
+		)
 		slowApplies.Inc()
 	}
 }
 
 func isNil(msg proto.Message) bool {
 	return msg == nil || reflect.ValueOf(msg).IsNil()
+}
+
+// panicAlternativeStringer wraps a fmt.Stringer, and if calling String() panics, calls the alternative instead.
+// This is needed to ensure logging slow v2 requests does not panic, which occurs when running integration tests
+// with the embedded server with github.com/golang/protobuf v1.4.0+. See https://github.com/etcd-io/etcd/issues/12197.
+type panicAlternativeStringer struct {
+	stringer    fmt.Stringer
+	alternative func() string
+}
+
+func (n panicAlternativeStringer) String() (s string) {
+	defer func() {
+		if err := recover(); err != nil {
+			s = n.alternative()
+		}
+	}()
+	s = n.stringer.String()
+	return s
 }

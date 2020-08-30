@@ -18,9 +18,12 @@ import (
 	"sync"
 	"time"
 
-	"go.etcd.io/etcd/lease"
-	"go.etcd.io/etcd/mvcc/backend"
-	"go.etcd.io/etcd/mvcc/mvccpb"
+	"go.etcd.io/etcd/v3/etcdserver/cindex"
+	"go.etcd.io/etcd/v3/lease"
+	"go.etcd.io/etcd/v3/mvcc/backend"
+	"go.etcd.io/etcd/v3/mvcc/mvccpb"
+	"go.etcd.io/etcd/v3/pkg/traceutil"
+
 	"go.uber.org/zap"
 )
 
@@ -28,9 +31,8 @@ import (
 var (
 	// chanBufLen is the length of the buffered chan
 	// for sending out watched events.
-	// TODO: find a good buf value. 1024 is just a random one that
-	// seems to be reasonable.
-	chanBufLen = 1024
+	// See https://github.com/etcd-io/etcd/issues/11906 for more detail.
+	chanBufLen = 128
 
 	// maxWatchersPerSync is the number of watchers to sync in a single batch
 	maxWatchersPerSync = 512
@@ -68,13 +70,16 @@ type watchableStore struct {
 // cancel operations.
 type cancelFunc func()
 
-func New(lg *zap.Logger, b backend.Backend, le lease.Lessor, ig ConsistentIndexGetter) ConsistentWatchableKV {
-	return newWatchableStore(lg, b, le, ig)
+func New(lg *zap.Logger, b backend.Backend, le lease.Lessor, ci cindex.ConsistentIndexer, cfg StoreConfig) ConsistentWatchableKV {
+	return newWatchableStore(lg, b, le, ci, cfg)
 }
 
-func newWatchableStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ig ConsistentIndexGetter) *watchableStore {
+func newWatchableStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ci cindex.ConsistentIndexer, cfg StoreConfig) *watchableStore {
+	if lg == nil {
+		lg = zap.NewNop()
+	}
 	s := &watchableStore{
-		store:    NewStore(lg, b, le, ig),
+		store:    NewStore(lg, b, le, ci, cfg),
 		victimc:  make(chan struct{}, 1),
 		unsynced: newWatcherGroup(),
 		synced:   newWatcherGroup(),
@@ -84,7 +89,7 @@ func newWatchableStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ig Co
 	s.store.WriteView = &writeView{s}
 	if s.le != nil {
 		// use this store as the deleter so revokes trigger watch events
-		s.le.SetRangeDeleter(func() lease.TxnDelete { return s.Write() })
+		s.le.SetRangeDeleter(func() lease.TxnDelete { return s.Write(traceutil.TODO()) })
 	}
 	s.wg.Add(2)
 	go s.syncWatchersLoop()
@@ -147,10 +152,13 @@ func (s *watchableStore) cancelWatcher(wa *watcher) {
 		s.mu.Lock()
 		if s.unsynced.delete(wa) {
 			slowWatcherGauge.Dec()
+			watcherGauge.Dec()
 			break
 		} else if s.synced.delete(wa) {
+			watcherGauge.Dec()
 			break
 		} else if wa.compacted {
+			watcherGauge.Dec()
 			break
 		} else if wa.ch == nil {
 			// already canceled (e.g., cancel/close race)
@@ -158,6 +166,7 @@ func (s *watchableStore) cancelWatcher(wa *watcher) {
 		}
 
 		if !wa.victim {
+			s.mu.Unlock()
 			panic("watcher not victim but not in watch groups")
 		}
 
@@ -170,6 +179,7 @@ func (s *watchableStore) cancelWatcher(wa *watcher) {
 		}
 		if victimBatch != nil {
 			slowWatcherGauge.Dec()
+			watcherGauge.Dec()
 			delete(victimBatch, wa)
 			break
 		}
@@ -179,7 +189,6 @@ func (s *watchableStore) cancelWatcher(wa *watcher) {
 		time.Sleep(time.Millisecond)
 	}
 
-	watcherGauge.Dec()
 	wa.ch = nil
 	s.mu.Unlock()
 }
@@ -348,14 +357,9 @@ func (s *watchableStore) syncWatchers() int {
 	tx := s.store.b.ReadTx()
 	tx.RLock()
 	revs, vs := tx.UnsafeRange(keyBucketName, minBytes, maxBytes, 0)
-	var evs []mvccpb.Event
-	if s.store != nil && s.store.lg != nil {
-		evs = kvsToEvents(s.store.lg, wg, revs, vs)
-	} else {
-		// TODO: remove this in v3.5
-		evs = kvsToEvents(nil, wg, revs, vs)
-	}
 	tx.RUnlock()
+	var evs []mvccpb.Event
+	evs = kvsToEvents(s.store.lg, wg, revs, vs)
 
 	var victims watcherBatch
 	wb := newWatcherBatch(wg, evs)
@@ -410,11 +414,7 @@ func kvsToEvents(lg *zap.Logger, wg *watcherGroup, revs, vals [][]byte) (evs []m
 	for i, v := range vals {
 		var kv mvccpb.KeyValue
 		if err := kv.Unmarshal(v); err != nil {
-			if lg != nil {
-				lg.Panic("failed to unmarshal mvccpb.KeyValue", zap.Error(err))
-			} else {
-				plog.Panicf("cannot unmarshal event: %v", err)
-			}
+			lg.Panic("failed to unmarshal mvccpb.KeyValue", zap.Error(err))
 		}
 
 		if !wg.contains(string(kv.Key)) {
@@ -438,14 +438,10 @@ func (s *watchableStore) notify(rev int64, evs []mvccpb.Event) {
 	var victim watcherBatch
 	for w, eb := range newWatcherBatch(&s.synced, evs) {
 		if eb.revs != 1 {
-			if s.store != nil && s.store.lg != nil {
-				s.store.lg.Panic(
-					"unexpected multiple revisions in watch notification",
-					zap.Int("number-of-revisions", eb.revs),
-				)
-			} else {
-				plog.Panicf("unexpected multiple revisions in notification")
-			}
+			s.store.lg.Panic(
+				"unexpected multiple revisions in watch notification",
+				zap.Int("number-of-revisions", eb.revs),
+			)
 		}
 		if w.send(WatchResponse{WatchID: w.id, Events: eb.evs, Revision: rev}) {
 			pendingEventsGauge.Add(float64(len(eb.evs)))

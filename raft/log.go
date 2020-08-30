@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"log"
 
-	pb "go.etcd.io/etcd/raft/raftpb"
+	pb "go.etcd.io/etcd/v3/raft/raftpb"
 )
 
 type raftLog struct {
@@ -165,6 +165,11 @@ func (l *raftLog) nextEnts() (ents []pb.Entry) {
 func (l *raftLog) hasNextEnts() bool {
 	off := max(l.applied+1, l.firstIndex())
 	return l.committed+1 > off
+}
+
+// hasPendingSnapshot returns if there is pending snapshot waiting for applying.
+func (l *raftLog) hasPendingSnapshot() bool {
+	return l.unstable.snapshot != nil && !IsEmptySnap(*l.unstable.snapshot)
 }
 
 func (l *raftLog) snapshot() (pb.Snapshot, error) {
@@ -332,8 +337,10 @@ func (l *raftLog) slice(lo, hi, maxSize uint64) ([]pb.Entry, error) {
 	if hi > l.unstable.offset {
 		unstable := l.unstable.slice(max(lo, l.unstable.offset), hi)
 		if len(ents) > 0 {
-			ents = append([]pb.Entry{}, ents...)
-			ents = append(ents, unstable...)
+			combined := make([]pb.Entry, len(ents)+len(unstable))
+			n := copy(combined, ents)
+			copy(combined[n:], unstable)
+			ents = combined
 		} else {
 			ents = unstable
 		}

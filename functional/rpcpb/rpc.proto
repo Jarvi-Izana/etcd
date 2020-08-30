@@ -95,6 +95,9 @@ message Member {
   string SnapshotPath = 601 [(gogoproto.moretags) = "yaml:\"snapshot-path\""];
   // SnapshotInfo contains last SAVE_SNAPSHOT request results.
   SnapshotInfo SnapshotInfo = 602;
+
+  // Failpoints is the GOFAIL_FAILPOINTS environment variable value to use when starting etcd.
+  string Failpoints = 701  [(gogoproto.moretags) = "yaml:\"failpoints\""];
 }
 
 message Tester {
@@ -234,7 +237,7 @@ message Etcd {
   string Logger = 71 [(gogoproto.moretags) = "yaml:\"logger\""];
   // LogOutputs is the log file to store current etcd server logs.
   repeated string LogOutputs = 72 [(gogoproto.moretags) = "yaml:\"log-outputs\""];
-  bool Debug = 73 [(gogoproto.moretags) = "yaml:\"debug\""];
+  string LogLevel = 73 [(gogoproto.moretags) = "yaml:\"log-level\""];
 }
 
 enum Operation {
